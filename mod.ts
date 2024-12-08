@@ -2,9 +2,9 @@ import * as http from "@std/http";
 import * as path from "@std/path/posix";
 import * as fs from "@std/fs";
 import * as frontmatter from "@std/front-matter";
-
+import { compile } from "mdx";
 import { transpile } from "@deno/emit";
-
+import { renderToString } from "react-dom/server";
 import { CSS, render, type RenderOptions } from "@deno/gfm";
 import "prismjs/components/prism-bash.min.js";
 import "prismjs/components/prism-javascript.min.js";
@@ -37,7 +37,7 @@ type FileServerOptions = {
 export class FileServer {
     constructor(private options: FileServerOptions = {}) { }
 
-    private resolve(pathname: string) {
+    private resolve(pathname: string): string {
         if (this.options.urlRoot) {
             if (!pathname.startsWith(this.options.urlRoot)) {
                 throw new Error("Invalid pathname");
@@ -76,7 +76,8 @@ export class FileServer {
             && this.options.showIndex
             && this.options.gfm
             && !await fs.exists(this.resolve(path.join(url.pathname, "index.html")))
-            && await fs.exists(this.resolve(path.join(url.pathname, "index.md")))
+            && (await fs.exists(this.resolve(path.join(url.pathname, "index.md")))
+                || await fs.exists(this.resolve(path.join(url.pathname, "index.mdx"))))
         ) {
             return this.serveMarkdown(req);
         }
@@ -88,7 +89,7 @@ export class FileServer {
             return this.serveTranspiled(req);
         }
 
-        if (this.options.gfm && extension === ".md") {
+        if (this.options.gfm && [".md", ".mdx"].includes(extension)) {
             return this.serveMarkdown(req);
         }
 
@@ -217,7 +218,12 @@ export class FileServer {
         if (fileinfo.isDirectory) {
             const index = path.join(this.options.fsRoot || ".", url.pathname, "index.md");
             if (!await fs.exists(index)) {
-                return http.serveDir(req, this.options);
+                const index2 = path.join(this.options.fsRoot || ".", url.pathname, "index.mdx");
+                if (!await fs.exists(index2)) {
+                    return http.serveDir(req, this.options);
+                }
+                return this.serveMarkdown(new Request(`${url.origin}${path.join(url.pathname, "index.mdx")}`));
+
             }
 
             return this.serveMarkdown(new Request(`${url.origin}${path.join(url.pathname, "index.md")}`));
@@ -245,6 +251,29 @@ export class FileServer {
             }
         }
 
+        if (filepath.endsWith(".mdx")) {
+            const mdx = await import("data:text/javascript," + (await compile(markdown, {
+                jsxImportSource: "react",
+                outputFormat: "program",
+            })).value);
+            const main = renderToString(mdx.default());
+            const body = layout(options.title || url.pathname, main);
+            const res = new Response(body, {
+                headers: {
+                    "Content-Type": "text/html; charset=utf-8",
+                    "last-modified": fileinfo.mtime?.toUTCString() || "",
+                },
+            });
+
+            if (this.options.enableCors) {
+                res.headers.set("Access-Control-Allow-Origin", "*");
+            }
+
+            if (this.options.cache) {
+                await cache.put(req, res.clone());
+            }
+            return res;
+        }
         const main = render(markdown, options);
         const body = layout(options.title || url.pathname, main);
         const res = new Response(body, {
